@@ -6,41 +6,41 @@ from torchvision import transforms, models
 import numpy as np
 from tqdm import tqdm
 from medmnist import PathMNIST
-import copy
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 class Config:
     def __init__(self):
         # Device configuration
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # MAML parameters
-        self.num_adaptation_steps = 5
-        self.alpha = 0.01  # Inner loop LR
-        self.beta = 0.001  # Outer loop LR
+        # Training parameters
+        self.epochs = 80  # Tăng số epoch
+        self.lr = 3e-4
+        self.weight_decay = 1e-5
         
         # Few-shot parameters
         self.n_way = 5
         self.k_shot = 5
         self.n_query = 15
-        self.meta_batch_size = 4
-        self.train_episodes = 400
+        self.train_episodes = 400  # Tăng số episodes huấn luyện
         self.test_episodes = 600
         
-        # Training parameters
-        self.epochs = 50
-        
         # Model parameters
-        self.embedding_dim = 64
+        self.embedding_dim = 256  # Tăng embedding dimension
+        self.relation_dim = 64    # Tăng relation dimension
 
+config = Config()
 
+## 1. Data Pipeline với Augmentation mạnh hơn
 def get_transforms():
     return {
         'train': transforms.Compose([
             transforms.ToTensor(),
             transforms.Resize((32, 32)),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ]),
         'test': transforms.Compose([
@@ -50,17 +50,12 @@ def get_transforms():
         ])
     }
 
-
 def load_datasets():
     transforms_dict = get_transforms()
     train_dataset = PathMNIST(split='train', download=True, transform=transforms_dict['train'])
     val_dataset = PathMNIST(split='val', download=True, transform=transforms_dict['test'])
     test_dataset = PathMNIST(split='test', download=True, transform=transforms_dict['test'])
-    
-    sample, label = train_dataset[0]
-    assert sample.shape == (3, 32, 32), f"Wrong image shape: {sample.shape}"
     return train_dataset, val_dataset, test_dataset
-
 
 class EpisodeDataset(Dataset):
     def __init__(self, dataset, config, is_train=True):
@@ -76,6 +71,7 @@ class EpisodeDataset(Dataset):
     
     def __getitem__(self, idx):
         selected_classes = np.random.choice(self.classes, self.config.n_way, replace=False)
+        
         support_images, support_labels = [], []
         query_images, query_labels = [], []
         
@@ -83,156 +79,208 @@ class EpisodeDataset(Dataset):
             indices = self.class_to_indices[cls]
             selected_idx = np.random.choice(indices, self.config.k_shot + self.config.n_query, False)
             
+            # Support set
             support_images.extend([self.dataset[j][0] for j in selected_idx[:self.config.k_shot]])
             support_labels.extend([i] * self.config.k_shot)
             
+            # Query set
             query_images.extend([self.dataset[j][0] for j in selected_idx[self.config.k_shot:]])
             query_labels.extend([i] * self.config.n_query)
         
-        support_images = torch.stack(support_images)
-        query_images = torch.stack(query_images)
-        assert support_images.shape == (self.config.n_way*self.config.k_shot, 3, 32, 32)
-        assert query_images.shape == (self.config.n_way*self.config.n_query, 3, 32, 32)
-        
         return (
-            support_images,
+            torch.stack(support_images),
             torch.tensor(support_labels, dtype=torch.long),
-            query_images,
+            torch.stack(query_images),
             torch.tensor(query_labels, dtype=torch.long)
         )
 
-
-class MAMLModel(nn.Module):
+## 2. Model Pipeline với ResNet-18
+class ResNet18Embedding(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
+        
+        # Load ResNet18 pretrained
         resnet = models.resnet18(weights=None)
+        
+        # Điều chỉnh cho ảnh nhỏ
         resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        resnet.maxpool = nn.Identity()
+        resnet.maxpool = nn.Identity()  # Bỏ maxpool đầu tiên
+        
+        # Lấy các layer trước fc
         self.feature_extractor = nn.Sequential(*list(resnet.children())[:-1])
-        self.classifier = nn.Linear(512, config.n_way)
+        
+        # Projection head
+        self.projection = nn.Sequential(
+            nn.Linear(512, config.embedding_dim),
+            nn.BatchNorm1d(config.embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
         
     def forward(self, x):
-        x = self.feature_extractor(x)
-        x = x.view(x.size(0), -1)
-        return self.classifier(x)
+        features = self.feature_extractor(x)
+        features = features.view(features.size(0), -1)
+        return self.projection(features)
 
+class RelationNetwork(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        self.relation_net = nn.Sequential(
+            nn.Linear(config.embedding_dim * 2, config.relation_dim),
+            nn.BatchNorm1d(config.relation_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(config.relation_dim, config.relation_dim),
+            nn.BatchNorm1d(config.relation_dim),
+            nn.ReLU(),
+            
+            nn.Linear(config.relation_dim, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, query_features, support_features, support_labels):
+        n_way = len(torch.unique(support_labels))
+        k_shot = support_features.size(0) // n_way
+        n_query = query_features.size(0)
+        
+        # Tính prototype cho mỗi class
+        support_features = support_features.view(n_way, k_shot, -1)
+        prototypes = support_features.mean(dim=1)
+        
+        # Tạo các cặp query-prototype
+        query_features = query_features.unsqueeze(1).expand(-1, n_way, -1)
+        prototypes = prototypes.unsqueeze(0).expand(n_query, -1, -1)
+        
+        # Kết hợp features
+        combined = torch.cat([query_features, prototypes], dim=2)
+        combined = combined.view(-1, self.config.embedding_dim * 2)
+        
+        # Tính relation scores
+        relation_scores = self.relation_net(combined)
+        return relation_scores.view(n_query, n_way)
 
-def maml_train_step(model, batch, optimizer, config):
-    support_batch, s_labels_batch, query_batch, q_labels_batch = batch
-    meta_loss = 0.0
-    meta_acc = 0.0
-    initial_state = copy.deepcopy(model.state_dict())
-    batch_size = support_batch.size(0)
+class RelationNet(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.encoder = ResNet18Embedding(config)
+        self.relation = RelationNetwork(config)
+        
+    def forward(self, support_images, support_labels, query_images):
+        support_features = self.encoder(support_images)
+        query_features = self.encoder(query_images)
+        return self.relation(query_features, support_features, support_labels)
 
-    for i in range(batch_size):
-        support_images = support_batch[i].to(config.device)
-        support_labels = s_labels_batch[i].to(config.device)
-        query_images = query_batch[i].to(config.device)
-        query_labels = q_labels_batch[i].to(config.device)
+## 3. Training Pipeline
+def create_dataloaders(config):
+    train_dataset, val_dataset, test_dataset = load_datasets()
+    
+    train_episodes = EpisodeDataset(train_dataset, config, is_train=True)
+    val_episodes = EpisodeDataset(val_dataset, config, is_train=False)
+    test_episodes = EpisodeDataset(test_dataset, config, is_train=False)
+    
+    train_loader = DataLoader(train_episodes, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_episodes, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_episodes, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+    
+    return train_loader, val_loader, test_loader
 
-        # Inner loop
-        adapted_model = copy.deepcopy(model)
-        adapted_optimizer = torch.optim.SGD(adapted_model.parameters(), lr=config.alpha)
-        adapted_model.train()
-        for _ in range(config.num_adaptation_steps):
-            outputs = adapted_model(support_images)
-            loss = F.cross_entropy(outputs, support_labels)
-            adapted_optimizer.zero_grad()
-            loss.backward()
-            adapted_optimizer.step()
-
-        # Query evaluation
-        query_outputs = adapted_model(query_images)
-        loss_q = F.cross_entropy(query_outputs, query_labels)
-        meta_loss += loss_q.item()
-        _, preds = torch.max(query_outputs, 1)
-        meta_acc += (preds == query_labels).float().mean().item()
-
-    meta_loss /= batch_size
-    meta_acc /= batch_size
-
-    # Meta-update
-    optimizer.zero_grad()
-    dummy_in = torch.randn(1, 3, 32, 32).to(config.device)
-    dummy_out = model(dummy_in)
-    dummy_loss = dummy_out.sum() * 0
-    dummy_loss.backward()
-    optimizer.step()
-    model.load_state_dict(initial_state)
-
-    return meta_loss, meta_acc
-
-def evaluate_maml(model, loader, config):
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-
-    for support, s_labels, query, q_labels in loader:
+def train_epoch(model, loader, optimizer, config):
+    model.train()
+    total_loss, correct, total = 0, 0, 0
+    
+    pbar = tqdm(loader, desc="Training")
+    for support, s_labels, query, q_labels in pbar:
         support = support.squeeze(0).to(config.device)
         s_labels = s_labels.squeeze(0).to(config.device)
         query = query.squeeze(0).to(config.device)
         q_labels = q_labels.squeeze(0).to(config.device)
-
-        # Adaptation with grads
-        adapted_model = copy.deepcopy(model)
-        adapted_optimizer = torch.optim.SGD(adapted_model.parameters(), lr=config.alpha)
-        adapted_model.train()
-        for _ in range(config.num_adaptation_steps):
-            out = adapted_model(support)
-            loss_i = F.cross_entropy(out, s_labels)
-            adapted_optimizer.zero_grad()
-            loss_i.backward()
-            adapted_optimizer.step()
-
-        # Evaluation
-        adapted_model.eval()
-        with torch.no_grad():
-            out_q = adapted_model(query)
-            loss_q = F.cross_entropy(out_q, q_labels)
-        total_loss += loss_q.item()
-        _, preds = torch.max(out_q, 1)
+        
+        optimizer.zero_grad()
+        
+        # Forward pass
+        relation_scores = model(support, s_labels, query)
+        
+        # Tính loss
+        loss = F.cross_entropy(relation_scores, q_labels)
+        
+        # Backward pass với gradient clipping
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        # Tính accuracy
+        total_loss += loss.item()
+        _, preds = torch.max(relation_scores, 1)
         correct += (preds == q_labels).sum().item()
         total += q_labels.size(0)
+        
+        pbar.set_postfix({'Loss': total_loss/(pbar.n+1), 'Acc': 100*correct/total})
+    
+    return total_loss/len(loader), correct/total
 
-    return total_loss / len(loader), correct / total
+def evaluate(model, loader, config):
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Evaluating")
+        for support, s_labels, query, q_labels in pbar:
+            support = support.squeeze(0).to(config.device)
+            s_labels = s_labels.squeeze(0).to(config.device)
+            query = query.squeeze(0).to(config.device)
+            q_labels = q_labels.squeeze(0).to(config.device)
+            
+            relation_scores = model(support, s_labels, query)
+            loss = F.cross_entropy(relation_scores, q_labels)
+            
+            total_loss += loss.item()
+            _, preds = torch.max(relation_scores, 1)
+            correct += (preds == q_labels).sum().item()
+            total += q_labels.size(0)
+            
+            pbar.set_postfix({'Loss': total_loss/(pbar.n+1), 'Acc': 100*correct/total})
+    
+    return total_loss/len(loader), correct/total
 
-
+## 4. Main Execution
 def main():
     config = Config()
-    train_ds, val_ds, test_ds = load_datasets()
-    train_ep = EpisodeDataset(train_ds, config, is_train=True)
-    val_ep = EpisodeDataset(val_ds, config, is_train=False)
-    test_ep = EpisodeDataset(test_ds, config, is_train=False)
-
-    train_loader = DataLoader(train_ep, batch_size=config.meta_batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ep, batch_size=1, shuffle=False)
-    test_loader  = DataLoader(test_ep, batch_size=1, shuffle=False)
-
-    model = MAMLModel(config).to(config.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.beta)
-
-    best_val = 0.0
+    
+    # Tạo dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(config)
+    
+    # Khởi tạo model
+    model = RelationNet(config).to(config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
+    
+    best_val_acc = 0
     for epoch in range(config.epochs):
-        model.train()
-        train_loss, train_acc = 0.0, 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        for batch in pbar:
-            loss, acc = maml_train_step(model, batch, optimizer, config)
-            train_loss += loss
-            train_acc += acc
-            pbar.set_postfix({'Loss': f"{loss:.4f}", 'Acc': f"{acc*100:.2f}%"})
-        train_loss /= len(train_loader)
-        train_acc /= len(train_loader)
-
-        val_loss, val_acc = evaluate_maml(model, val_loader, config)
-        print(f"\nEpoch {epoch+1}/{config.epochs}: Train Loss={train_loss:.4f}, Acc={train_acc*100:.2f}% | Val Loss={val_loss:.4f}, Acc={val_acc*100:.2f}%")
-        if val_acc > best_val:
-            best_val = val_acc
-            torch.save(model.state_dict(), 'best_maml_model.pth')
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, config)
+        val_loss, val_acc = evaluate(model, val_loader, config)
+        scheduler.step()
+        
+        print(f"\nEpoch {epoch+1}/{config.epochs}:")
+        print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc*100:.2f}%")
+        print(f"Val Loss: {val_loss:.4f} | Acc: {val_acc*100:.2f}%")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), 'best_relationnet_resnet.pth')
             print("Saved new best model")
-
-    model.load_state_dict(torch.load('best_maml_model.pth'))
-    test_loss, test_acc = evaluate_maml(model, test_loader, config)
+    
+    # Đánh giá trên test set
+    model.load_state_dict(torch.load('best_relationnet_resnet.pth'))
+    test_loss, test_acc = evaluate(model, test_loader, config)
     print(f"\nFinal Test Accuracy: {test_acc*100:.2f}%")
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
